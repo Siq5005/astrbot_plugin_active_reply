@@ -37,6 +37,16 @@ class MyPlugin(Star):
         self.PICTURE = config.get("picture_quantity")
         self.ACTIVE_REPLY_ENABLED = config.get("active_reply_enabled", True)
 
+        # 仅图片注入模式下的「历史图片回退」准入条件（两个必须同时满足）：
+        #   ① 图片来自最近 FALLBACK_MAX_MESSAGES 条消息之内；
+        #   ② 该消息的时间距今不超过 FALLBACK_WINDOW_SECONDS 秒。
+        # 只按「历史里最近 N 张图」取会把很久以前的旧图挂到无关文字消息上。
+        self.FALLBACK_MAX_MESSAGES = 10
+        self.FALLBACK_WINDOW_SECONDS = 180
+        self.FALLBACK_KEEP_IMAGES = 6              # 候选图缓存上限（内存保护）
+        self.msg_seq: Dict[str, int] = {}          # 群 -> 消息序号（含机器人自己发的）
+        self.recent_images: Dict[str, List] = {}   # 群 -> [(序号, 时间, 发送者, base64)]
+
     def _is_gif(self, img_comp: Image) -> bool:
         """检查这个图片组件是不是 GIF"""
         url = getattr(img_comp, "url", None) or ""
@@ -314,6 +324,15 @@ class MyPlugin(Star):
             # 也不 stop_event，后续交给平台/其他插件正常处理。
             async with self.lock:
                 self._ensure_group_state(group_uid)
+                self.msg_seq[group_uid] = self.msg_seq.get(group_uid, 0) + 1
+                if img_b64_list:
+                    _seq = self.msg_seq[group_uid]
+                    _img_ts = event.created_at or datetime.now().timestamp()
+                    _sender = event.get_sender_name()
+                    _recent = self.recent_images.setdefault(group_uid, [])
+                    for _b64 in img_b64_list:
+                        _recent.append((_seq, _img_ts, _sender, _b64))
+                    del _recent[: max(0, len(_recent) - self.FALLBACK_KEEP_IMAGES)]
                 if self.last_time[group_uid] != current_time:
                     self.history[group_uid].append(f"[{current_time}]")
                     self.last_time[group_uid] = current_time
@@ -413,6 +432,7 @@ class MyPlugin(Star):
                         self.last_group_name[group_uid] = ""
                         self.pending[group_uid] = []
                         self.is_waiting[group_uid] = False
+                    self.msg_seq[group_uid] = self.msg_seq.get(group_uid, 0) + max(1, len(round_msgs))
                     self.history[group_uid].extend(round_msgs)  # ← extend 列表，不是遍历字符串            
                     if len(self.history[group_uid]) > self.MAX_HISTORY:
                             # 从头部删，保留最新的
@@ -434,6 +454,7 @@ class MyPlugin(Star):
                 self.last_group_name[group_uid] = ""
                 self.pending[group_uid] = []
                 self.is_waiting[group_uid] = False
+            self.msg_seq[group_uid] = self.msg_seq.get(group_uid, 0) + 1
             self.history[group_uid].append(bot_message)
             if len(self.history[group_uid]) > self.MAX_HISTORY:
                 self.history[group_uid].pop(0)
@@ -470,29 +491,35 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.warning(f"仅图片注入模式解析当前消息失败: {e}")
                 current_images = []
-        async with self.lock:
-            history_lines = list(self.history.get(group_uid, []) or [])
-
         if not current_images:
-            # 图片与 @ 分开发送时，chat_plus 的等待窗口会把两条合并进同一个事件，
-            # 触发 LLM 的那个事件自身没有图片。此时按「整个上下文历史中最近的
-            # 两张图片信息」回退，保证群友先发图、再提问时模型仍能看到图。
-            fallback_images: list[str] = []
-            for _line in reversed(history_lines):
-                for _m in re.finditer(r"\[IMG_B64:([A-Za-z0-9+/=]+)\]", _line):
-                    fallback_images.append(_m.group(1))
-                    if len(fallback_images) >= 2:
-                        break
-                if len(fallback_images) >= 2:
-                    break
-            if not fallback_images:
-                # 流水账只给图片场景使用：当前和历史都没有普通图片就不注入
+            # 图片与 @ 分开发送时才会用到：chat_plus 的等待窗口会把两条合并进同一个
+            # 事件，触发 LLM 的那个事件自身没有图片。准入条件必须同时满足——
+            #   ① 图片来自最近 FALLBACK_MAX_MESSAGES 条消息之内；
+            #   ② 该消息时间距今不超过 FALLBACK_WINDOW_SECONDS 秒。
+            async with self.lock:
+                _seq_now = self.msg_seq.get(group_uid, 0)
+                _cutoff = datetime.now().timestamp() - self.FALLBACK_WINDOW_SECONDS
+                picks = [
+                    _item
+                    for _item in (self.recent_images.get(group_uid) or [])
+                    if _item[0] > _seq_now - self.FALLBACK_MAX_MESSAGES
+                    and _item[1] >= _cutoff
+                ]
+            if not picks:
                 return
-            fallback_images.reverse()  # 恢复时间顺序
-            current_images = fallback_images
+            if self.PICTURE and len(picks) > self.PICTURE:
+                picks = picks[-self.PICTURE :]
+            current_images = [_item[3] for _item in picks]
+            _now = datetime.now().timestamp()
             logger.info(
-                f"仅图片注入模式：当前消息无图，回退取历史上最近 "
-                f"{len(current_images)} 张图片"
+                "仅图片注入模式：当前消息无图，回退注入最近 %d 条消息 / %d 秒窗口内的 "
+                "%d 张图（%s）"
+                % (
+                    self.FALLBACK_MAX_MESSAGES,
+                    self.FALLBACK_WINDOW_SECONDS,
+                    len(current_images),
+                    "、".join(f"{_item[2]} {int(_now - _item[1])}秒前" for _item in picks),
+                )
             )
         # 只注入图片，不碰 req.prompt / req.contexts：上下文（历史、记忆、工具）
         # 由 group_chat_plus 负责拼装，本插件再追加一份群聊流水账只会让同一段
