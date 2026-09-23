@@ -507,6 +507,24 @@ class MyPlugin(Star):
                 ]
             if not picks:
                 return
+            # 2026-09-23：同一批图被注入两遍——钩子拿到的 event 丢了 extra、重新解析
+            # 又被 chat_plus 的文字占位挡掉，于是误判"当前消息无图"走到了这里。
+            # 凡是请求里已经有的图（当前消息的图、chat_plus 注入的图）一律不再重复注入。
+            _have = {
+                str(_u).split("base64,", 1)[1] if "base64," in str(_u) else str(_u)
+                for _u in (getattr(req, "image_urls", None) or [])
+            }
+            _uniq: set[str] = set()
+            _kept = []
+            for _item in reversed(picks):          # 从新到旧挑，保证留下的是最新的
+                if _item[3] in _have or _item[3] in _uniq:
+                    continue
+                _uniq.add(_item[3])
+                _kept.append(_item)
+            picks = list(reversed(_kept))
+            if not picks:
+                logger.info("仅图片注入模式：当前消息无图，但窗口内的图都已在请求中，跳过注入")
+                return
             if self.PICTURE and len(picks) > self.PICTURE:
                 picks = picks[-self.PICTURE :]
             current_images = [_item[3] for _item in picks]
@@ -529,8 +547,14 @@ class MyPlugin(Star):
         # REPLY/SKIP，主动回复能力完整保留。
         extra = [f"data:image/jpeg;base64,{b64}" for b64 in current_images]
         existing = list(getattr(req, "image_urls", None) or [])
+        # 同上：请求里已经有的图不再重复注入（本条覆盖"重新解析当前消息"那条路径）
+        _have = {
+            str(_u).split("base64,", 1)[1] if "base64," in str(_u) else str(_u)
+            for _u in existing
+        }
+        extra = [_u for _u in extra if _u.split("base64,", 1)[1] not in _have]
         req.image_urls = existing + extra
-        logger.info(f"仅图片注入模式：注入 {len(current_images)} 张图片（流水账交由 chat_plus）")
+        logger.info(f"仅图片注入模式：注入 {len(extra)} 张图片（流水账交由 chat_plus）")
         
     # 优先级必须低于 group_chat_plus(-1) 与 gitee_aiimg(-20)：
     # 这两个插件的 on_llm_request 会覆盖 req.prompt / req.image_urls，
